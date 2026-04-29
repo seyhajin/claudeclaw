@@ -11,6 +11,7 @@ import {
 import { getSettings, DEFAULT_SESSION_TIMEOUT_MS, type ModelConfig, type SecurityConfig } from "./config";
 import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
+import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 // Resolve prompts relative to the claudeclaw installation, not the project dir
@@ -352,8 +353,8 @@ export async function runCompact(
  * High-level compact: resolves session + settings internally.
  * Returns { success, message }.
  */
-export async function compactCurrentSession(): Promise<{ success: boolean; message: string }> {
-  const existing = await getSession();
+export async function compactCurrentSession(agentName?: string): Promise<{ success: boolean; message: string }> {
+  const existing = await getSession(agentName);
   if (!existing) return { success: false, message: "No active session to compact." };
 
   const settings = getSettings();
@@ -375,18 +376,27 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
-async function execClaude(name: string, prompt: string, threadId?: string, modelOverride?: string, timeoutMsOverride?: number): Promise<RunResult> {
+async function execClaude(
+  name: string,
+  prompt: string,
+  threadId?: string,
+  modelOverride?: string,
+  timeoutMsOverride?: number,
+  agentName?: string
+): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
   const existing = threadId
     ? await getThreadSession(threadId)
-    : await getSession();
+    : await getSession(agentName);
   const isNew = !existing;
+  // Start the watchdog clock for resumed sessions (we know the ID immediately).
+  if (existing) startSession(existing.sessionId);
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const logFile = join(LOGS_DIR, `${name}-${timestamp}.log`);
 
   const settings = getSettings();
-  const { security, model, api, fallback, agentic } = settings;
+  const { security, model, api, fallback, agentic, watchdog } = settings;
 
   // Determine which model to use based on agentic routing
   let primaryConfig: ModelConfig;
@@ -488,9 +498,11 @@ async function execClaude(name: string, prompt: string, threadId?: string, model
         await createThreadSession(threadId, sessionId);
         console.log(`[${new Date().toLocaleTimeString()}] Thread session created: ${sessionId} (thread ${threadId.slice(0, 8)})`);
       } else {
-        await createSession(sessionId);
-        console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}`);
+        await createSession(sessionId, agentName);
+        const label = agentName ? ` (agent ${agentName})` : "";
+        console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}${label}`);
       }
+      startSession(sessionId);
     } catch (e) {
       console.error(`[${new Date().toLocaleTimeString()}] Failed to parse session from Claude output:`, e);
     }
@@ -518,6 +530,26 @@ async function execClaude(name: string, prompt: string, threadId?: string, model
 
   await Bun.write(logFile, output);
   console.log(`[${new Date().toLocaleTimeString()}] Done: ${name} → ${logFile}`);
+
+  // --- Watchdog: track consecutive timeouts ---
+  // Skip tracking for unresolved session IDs ("unknown") to avoid cross-session
+  // state collisions when a new session fails before its real ID is known.
+  const trackingId = sessionId !== "unknown" ? sessionId : null;
+  if (trackingId) {
+    if (exitCode === 0) {
+      clearSession(trackingId);
+    } else {
+      recordResult(trackingId, exitCode);
+      const reason = abortReason(trackingId, watchdog);
+      if (reason) {
+        console.warn(`[${new Date().toLocaleTimeString()}] ${reason}`);
+        clearSession(trackingId);
+        return result;
+      }
+      // Non-timeout, non-zero exits: counter is already reset by recordResult.
+      // Do NOT clearSession here — that would reset startedAt and weaken maxRuntimeSeconds.
+    }
+  }
 
   // --- Auto-compact on timeout (exit 124) ---
   if (COMPACT_TIMEOUT_ENABLED && exitCode === 124 && !isNew && existing) {
@@ -549,7 +581,7 @@ async function execClaude(name: string, prompt: string, threadId?: string, model
       });
 
       if (retryExec.exitCode === 0) {
-        const count = threadId ? await incrementThreadTurn(threadId) : await incrementTurn();
+        const count = threadId ? await incrementThreadTurn(threadId) : await incrementTurn(agentName);
         console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${count} (after compact + retry)`);
       }
       return retryResult;
@@ -558,14 +590,15 @@ async function execClaude(name: string, prompt: string, threadId?: string, model
 
   // --- Turn tracking & compact warning ---
   if (exitCode === 0 && !isNew) {
-    const turnCount = threadId ? await incrementThreadTurn(threadId) : await incrementTurn();
-    console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${turnCount}${threadId ? ` (thread ${threadId.slice(0, 8)})` : ""}`);
+    const turnCount = threadId ? await incrementThreadTurn(threadId) : await incrementTurn(agentName);
+    const turnLabel = threadId ? ` (thread ${threadId.slice(0, 8)})` : agentName ? ` (agent ${agentName})` : "";
+    console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${turnCount}${turnLabel}`);
 
     if (turnCount >= COMPACT_WARN_THRESHOLD && existing && !existing.compactWarned) {
       if (threadId) {
         await markThreadCompactWarned(threadId);
       } else {
-        await markCompactWarned();
+        await markCompactWarned(agentName);
       }
       emitCompactEvent({ type: "warn", turnCount });
     }
@@ -574,8 +607,15 @@ async function execClaude(name: string, prompt: string, threadId?: string, model
   return result;
 }
 
-export async function run(name: string, prompt: string, threadId?: string, modelOverride?: string, timeoutMs?: number): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs), threadId);
+export async function run(
+  name: string,
+  prompt: string,
+  threadId?: string,
+  modelOverride?: string,
+  timeoutMs?: number,
+  agentName?: string
+): Promise<RunResult> {
+  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs, agentName), threadId);
 }
 
 async function streamClaude(
