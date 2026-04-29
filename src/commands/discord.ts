@@ -1,4 +1,4 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, compactCurrentThreadSession, safeAgentSlug } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, compactCurrentThreadSession, agentDirKey } from "../runner";
 import { getSettings, loadSettings } from "../config";
 import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
@@ -128,7 +128,7 @@ function upsertThread(id: string, parentId: string, rawName?: string): void {
   const existing = knownThreads.get(id);
   let agentName: string | undefined;
   if (rawName) {
-    try { agentName = `${safeAgentSlug(rawName)}-${id}`; } catch { /* unsanitizable — no agent scoping */ }
+    try { agentName = agentDirKey(rawName, id); } catch { /* unsanitizable — no agent scoping */ }
   }
   knownThreads.set(id, { parentId, agentName: agentName ?? existing?.agentName });
 }

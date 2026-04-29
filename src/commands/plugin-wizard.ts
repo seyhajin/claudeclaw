@@ -1,5 +1,5 @@
 import { runPluginCli, readPluginManifest, type PluginManifest } from "./plugin-cli";
-import { ensureAgentDir, safeAgentSlug } from "../runner";
+import { ensureAgentDir } from "../runner";
 
 const WIZARD_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -90,12 +90,10 @@ Reply with a number. Send 'cancel' at any time to exit and return to normal chat
 (While this wizard is open all messages are routed here, not to Claude.)`;
 
 function buildScopePrompt(agentName?: string): string {
-  let projectNote = "2) project — .claude/plugins/ (this deployment only)";
-  if (agentName) {
-    try {
-      projectNote = `2) project — agents/${safeAgentSlug(agentName)}/.claude/plugins/ (this agent only)`;
-    } catch { /* unsanitizable name — fall back to generic */ }
-  }
+  // agentName is already a normalised key (from agentDirKey) — display it directly.
+  const projectNote = agentName
+    ? `2) project — agents/${agentName}/.claude/plugins/ (this agent only)`
+    : "2) project — .claude/plugins/ (this deployment only)";
   return `Install scope (reply 'cancel' to exit):\n\n1) user — ~/.claude/plugins/ (available to all agents)\n${projectNote}\n`;
 }
 
@@ -214,7 +212,7 @@ export async function handleWizardInput(ctx: WizardContext, rawText: string): Pr
       const msg = formatResult(r.ok, r.stdout, r.stderr);
       if (r.ok) {
         const location = state.scope === "project" && ctx.agentName
-          ? `agents/${safeAgentSlug(ctx.agentName)}/.claude/plugins/`
+          ? `agents/${ctx.agentName}/.claude/plugins/`
           : "~/.claude/plugins/";
         return `${msg}\n\nInstalled to ${location}. Skills it provides will be available as /<plugin>:<skill-name> commands.`;
       }

@@ -210,8 +210,8 @@ async function runClaudeOnce(
 const PROJECT_DIR = process.cwd();
 
 // Converts a raw agent/thread display name to a safe filesystem segment.
-// Only [a-z0-9_-] characters are allowed; spaces and other separators become hyphens.
-// Exported so callers can show the canonical form in UI before creating the directory.
+// Converts a display name to a safe filesystem segment (no unique suffix).
+// Exported for display-only use (e.g. showing the human-readable name in UI).
 export function safeAgentSlug(raw: string): string {
   const slug = raw
     .toLowerCase()
@@ -222,12 +222,30 @@ export function safeAgentSlug(raw: string): string {
   return slug;
 }
 
+// Builds a guaranteed-unique, filesystem-safe directory key for an agent thread.
+// Truncates the display slug to leave room for "-<threadId>" so the suffix is
+// NEVER truncated away on a second slugging pass.
+export function agentDirKey(rawName: string, threadId: string): string {
+  const suffix = `-${threadId}`;
+  const maxSlugLen = Math.max(1, 64 - suffix.length);
+  const slug = rawName
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, maxSlugLen);
+  if (!slug) throw new Error(`Agent name "${rawName}" cannot be converted to a safe path segment`);
+  return `${slug}${suffix}`;
+}
+
 // Returns the working directory for a named agent's Claude spawn.
-// Sanitizes the name and verifies the result stays under PROJECT_DIR/agents/.
-export async function ensureAgentDir(agentName: string): Promise<string> {
+// Accepts an already-normalised key (from agentDirKey or safeAgentSlug) — does NOT
+// re-slug, so the threadId suffix is preserved. Verifies the result stays under agents/.
+export async function ensureAgentDir(key: string): Promise<string> {
+  if (!/^[a-z0-9_-]+$/.test(key)) {
+    throw new Error(`Agent key "${key}" contains unsafe characters`);
+  }
   const agentsRoot = join(PROJECT_DIR, "agents");
-  const dir = join(agentsRoot, safeAgentSlug(agentName));
-  // Belt-and-suspenders: confirm we haven't escaped the agents/ root
+  const dir = join(agentsRoot, key);
   if (!resolve(dir).startsWith(resolve(agentsRoot) + sep)) {
     throw new Error(`Agent directory "${dir}" would escape the agents root — rejecting`);
   }
