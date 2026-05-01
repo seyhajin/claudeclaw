@@ -78,6 +78,7 @@ const DEFAULT_SETTINGS: Settings = {
   },
   telegram: { token: "", allowedUserIds: [], listenChats: [] },
   discord: { token: "", allowedUserIds: [], listenChannels: [], listenGuilds: [] },
+  slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
@@ -114,6 +115,13 @@ export interface DiscordConfig {
   listenGuilds: string[]; // Guild IDs where bot responds to all messages in any channel/thread
 }
 
+export interface SlackConfig {
+  botToken: string;       // xoxb-... bot token
+  appToken: string;       // xapp-... Socket Mode token
+  allowedUserIds: string[];
+  listenChannels: string[]; // Channel IDs where bot responds without @mention
+}
+
 export type SecurityLevel =
   | "locked"
   | "strict"
@@ -136,6 +144,7 @@ export interface Settings {
   heartbeat: HeartbeatConfig;
   telegram: TelegramConfig;
   discord: DiscordConfig;
+  slack: SlackConfig;
   security: SecurityConfig;
   web: WebConfig;
   stt: SttConfig;
@@ -307,6 +316,12 @@ function parseSettings(
       listenGuilds: Array.isArray(raw.discord?.listenGuilds)
         ? raw.discord.listenGuilds.map(String)
         : [],
+    },
+    slack: {
+      botToken: process.env.SLACK_BOT_TOKEN?.trim() || (typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : ""),
+      appToken: process.env.SLACK_APP_TOKEN?.trim() || (typeof raw.slack?.appToken === "string" ? raw.slack.appToken.trim() : ""),
+      allowedUserIds: Array.isArray(raw.slack?.allowedUserIds) ? raw.slack.allowedUserIds.map(String) : [],
+      listenChannels: Array.isArray(raw.slack?.listenChannels) ? raw.slack.listenChannels.map(String) : [],
     },
     security: {
       level,
