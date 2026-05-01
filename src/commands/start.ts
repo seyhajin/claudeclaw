@@ -7,7 +7,7 @@ import { cronMatches, nextCronMatch } from "../cron";
 import { clearJobSchedule, loadJobs } from "../jobs";
 import { writePidFile, cleanupPidFile, checkExistingDaemon } from "../pid";
 import { initConfig, loadSettings, reloadSettings, resolvePrompt, type HeartbeatConfig, type Settings } from "../config";
-import { getDayAndMinuteAtOffset } from "../timezone";
+import { getDayAndMinuteAtOffset, buildClockPromptPrefix } from "../timezone";
 import { startWebUi, type WebServerHandle } from "../web";
 import type { Job } from "../jobs";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
@@ -581,7 +581,8 @@ export async function start(args: string[] = []) {
             .filter((part) => part.length > 0)
             .join("\n\n");
           if (!mergedPrompt) return null;
-          return run("heartbeat", mergedPrompt);
+          const clock = buildClockPromptPrefix(new Date(), currentSettings.timezoneOffsetMinutes);
+          return run("heartbeat", `${clock}\n${mergedPrompt}`);
         })
         .then((r) => {
           if (!r) return;
@@ -718,16 +719,17 @@ export async function start(args: string[] = []) {
   function runJob(job: (typeof currentJobs)[0]) {
     const timeoutMs = job.timeoutSeconds ? job.timeoutSeconds * 1000 : undefined;
     resolvePrompt(job.prompt)
-      .then((prompt) =>
-        run(
+      .then((prompt) => {
+        const clock = buildClockPromptPrefix(new Date(), currentSettings.timezoneOffsetMinutes);
+        return run(
           job.name,
-          prompt,
+          `${clock}\n${prompt}`,
           job.agent ? `agent:${job.agent}` : job.name,
           job.model,
           timeoutMs,
           job.agent
-        )
-      )
+        );
+      })
       .then((r) => {
         if (r.exitCode === 0) {
           jobRetryState.delete(job.name);
