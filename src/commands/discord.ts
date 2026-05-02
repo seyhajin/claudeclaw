@@ -358,6 +358,7 @@ async function uploadImageMessage(
 // --- Thread rejoin helper ---
 async function rejoinThreads(token: string): Promise<void> {
   const threadSessions = await listThreadSessions();
+  let rejoinedCount = 0;
   for (const ts of threadSessions) {
     // Skip non-snowflake keys (e.g. job names); they are not Discord channel IDs.
     if (!/^\d{17,19}$/.test(ts.threadId)) continue;
@@ -372,13 +373,14 @@ async function rejoinThreads(token: string): Promise<void> {
 
       await discordApi(token, "DELETE", `/channels/${ts.threadId}/thread-members/@me`).catch(() => {});
       await discordApi(token, "PUT", `/channels/${ts.threadId}/thread-members/@me`);
+      rejoinedCount += 1;
       console.log(`[Discord] Rejoined thread: ${ts.threadId}`);
     } catch (err) {
       console.error(`[Discord] Failed to rejoin thread ${ts.threadId}: ${err}`);
     }
   }
-  if (threadSessions.length > 0) {
-    console.log(`[Discord] Rejoined ${threadSessions.length} thread(s) from sessions.json`);
+  if (rejoinedCount > 0) {
+    console.log(`[Discord] Rejoined ${rejoinedCount} thread(s) from sessions.json`);
   }
 }
 
