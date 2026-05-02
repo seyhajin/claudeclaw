@@ -4,18 +4,22 @@ import { existsSync } from "fs";
 import {
   getSession,
   createSession,
+  resetSession,
   incrementTurn,
   markCompactWarned,
   getFallbackSession,
   createFallbackSession,
+  resetFallbackSession,
   incrementFallbackTurn,
   peekSession,
   incrementMessageCount,
+  backupSession,
 } from "./sessions";
 import { needsRotation, rotateSession, loadLatestSummary } from "./rotation";
 import {
   getThreadSession,
   createThreadSession,
+  removeThreadSession,
   incrementThreadTurn,
   markThreadCompactWarned,
 } from "./sessionManager";
@@ -116,7 +120,62 @@ export interface RunResult {
   exitCode: number;
 }
 
-const RATE_LIMIT_PATTERN = /you.ve hit your limit|out of extra usage/i;
+export interface AgentStreamEvent {
+  type: "spawn" | "done";
+  id: string;
+  description: string;
+  result?: string;
+}
+
+const RATE_LIMIT_PATTERN = /you(?:'|')ve hit your limit|out of extra usage/i;
+const RATE_LIMIT_RESET_PATTERN = /resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*\(?\s*UTC\s*\)?/i;
+const SIGNATURE_ERROR = /Invalid.*signature.*thinking block/i;
+
+// --- Rate limit state ---
+let rateLimitResetAt: number = 0; // epoch ms; 0 = not rate-limited
+let rateLimitNotified: boolean = false;
+
+function parseRateLimitResetTime(text: string): number | null {
+  const match = text.match(RATE_LIMIT_RESET_PATTERN);
+  if (!match) return null;
+
+  let hours = Number(match[1]);
+  const minutes = match[2] ? Number(match[2]) : 0;
+  const ampm = match[3]?.toLowerCase();
+
+  if (ampm === "pm" && hours < 12) hours += 12;
+  if (ampm === "am" && hours === 12) hours = 0;
+
+  const now = new Date();
+  const reset = new Date(now);
+  reset.setUTCHours(hours, minutes, 0, 0);
+  if (reset.getTime() <= now.getTime()) {
+    reset.setUTCDate(reset.getUTCDate() + 1);
+  }
+  return reset.getTime();
+}
+
+export function isRateLimited(): boolean {
+  if (rateLimitResetAt === 0) return false;
+  if (Date.now() >= rateLimitResetAt) {
+    rateLimitResetAt = 0;
+    rateLimitNotified = false;
+    return false;
+  }
+  return true;
+}
+
+export function getRateLimitResetAt(): number {
+  return rateLimitResetAt;
+}
+
+export function wasRateLimitNotified(): boolean {
+  return rateLimitNotified;
+}
+
+export function markRateLimitNotified(): void {
+  rateLimitNotified = true;
+}
 
 // Serial queue — prevents concurrent --resume on the same session
 // Global queue for non-thread messages (backward compatible)
@@ -175,6 +234,36 @@ function buildChildEnv(baseEnv: Record<string, string>, model: string, api: stri
   }
 
   return childEnv;
+}
+
+/**
+ * Resolve the subprocess timeout (in ms) for a given invocation category.
+ * Values are read fresh from settings on every call, so hot-reload works
+ * automatically: edit settings.json and the next subprocess picks it up.
+ *
+ * Category mapping:
+ *   "telegram"  → settings.timeouts.telegram  (default 5 min)
+ *   "heartbeat" → settings.timeouts.heartbeat (default 15 min)
+ *   "job"       → settings.timeouts.job       (default 30 min)
+ *   anything else (bootstrap, trigger, chat…) → settings.timeouts.default (default 5 min)
+ *
+ * Use execClaude's `timeoutCategory` param to pass the category separately from
+ * the display/log/session name (e.g. scheduled jobs use job.name for the session
+ * ID but pass "job" as the category so they get timeouts.job, not timeouts.default).
+ */
+function resolveTimeoutMs(name: string): number {
+  const t = getSettings().timeouts;
+  let minutes: number;
+  if (name === "telegram") {
+    minutes = t.telegram;
+  } else if (name === "heartbeat") {
+    minutes = t.heartbeat;
+  } else if (name === "job") {
+    minutes = t.job;
+  } else {
+    minutes = t.default;
+  }
+  return minutes * 60_000;
 }
 
 // Cap stdout/stderr to prevent unbounded memory growth.
@@ -623,7 +712,8 @@ async function execClaude(
   threadId?: string,
   modelOverride?: string,
   timeoutMsOverride?: number,
-  agentName?: string
+  agentName?: string,
+  timeoutCategory?: string
 ): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
@@ -676,10 +766,10 @@ async function execClaude(
     api: fallback?.api ?? "",
   };
   const securityArgs = buildSecurityArgs(security);
-  const timeoutMs = timeoutMsOverride ?? settings.sessionTimeoutMs;
+  const timeoutMs = timeoutMsOverride ?? resolveTimeoutMs(timeoutCategory ?? name);
 
   console.log(
-    `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level})`
+    `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level}, timeout: ${timeoutMs / 60_000}m)`
   );
 
   // Plugins: before_agent_start — fired before Claude is invoked.
@@ -748,8 +838,23 @@ async function execClaude(
     }
     exec = await runClaudeStream(fallbackArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, spawnCwd);
     usedFallback = true;
-    const fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
-    if (!fallbackRateLimit) {
+    let fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
+
+    // If the fallback resumed a corrupted session, reset it and retry fresh.
+    if (!fallbackRateLimit && fallbackSession && exec.exitCode !== 0 && SIGNATURE_ERROR.test(exec.rawStdout + exec.stderr)) {
+      await resetFallbackSession(agentName);
+      const flabel = agentName ? ` (agent ${agentName})` : "";
+      console.warn(
+        `[${new Date().toLocaleTimeString()}] Detected corrupted fallback session (thinking block signature mismatch). Reset${flabel}, retrying fallback fresh...`
+      );
+      const freshFallbackArgs = fallbackArgs.filter((a) => a !== "--resume" && a !== fallbackSession.sessionId);
+      exec = await runClaudeStream(freshFallbackArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, spawnCwd);
+      fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
+      if (!fallbackRateLimit && exec.sessionId) {
+        await createFallbackSession(exec.sessionId, agentName);
+        console.log(`[${new Date().toLocaleTimeString()}] Fallback session recovered: ${exec.sessionId}${flabel}`);
+      }
+    } else if (!fallbackRateLimit) {
       if (!fallbackSession && exec.sessionId) {
         await createFallbackSession(exec.sessionId, agentName);
         const label = agentName ? ` (agent ${agentName})` : "";
@@ -760,15 +865,60 @@ async function execClaude(
     }
   }
 
-  const rawStdout = exec.rawStdout;
-  const stderr = exec.stderr;
-  const exitCode = exec.exitCode;
+  let rawStdout = exec.rawStdout;
+  let stderr = exec.stderr;
+  let exitCode = exec.exitCode;
   let stdout = rawStdout;
   let sessionId = existing?.sessionId ?? "unknown";
+
+  // Auto-detect corrupted primary session from thinking block signature mismatch.
+  // Gated on !usedFallback — fallback corruption is handled inside the fallback block above.
+  if (exitCode !== 0 && !isNew && !usedFallback && SIGNATURE_ERROR.test(rawStdout + stderr)) {
+    if (threadId) {
+      await removeThreadSession(threadId);
+    } else if (agentName) {
+      await resetSession(agentName);
+    } else {
+      await backupSession();
+    }
+    const label = threadId ? ` (thread ${threadId.slice(0, 8)})` : agentName ? ` (agent ${agentName})` : "";
+    console.warn(
+      `[${new Date().toLocaleTimeString()}] Detected corrupted session (thinking block signature mismatch). Reset${label}, retrying with fresh session...`
+    );
+    const freshArgs = args.filter((a) => a !== "--resume" && a !== existing?.sessionId);
+    const fmtIdx = freshArgs.indexOf("--output-format");
+    if (fmtIdx !== -1 && fmtIdx + 1 < freshArgs.length) freshArgs[fmtIdx + 1] = "stream-json";
+    exec = await runClaudeStream(freshArgs, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd);
+    rawStdout = exec.rawStdout;
+    stderr = exec.stderr;
+    exitCode = exec.exitCode;
+    stdout = rawStdout;
+
+    // Persist the fresh session ID so subsequent calls resume it correctly.
+    if (exec.sessionId) {
+      sessionId = exec.sessionId;
+      if (threadId) {
+        await createThreadSession(threadId, sessionId);
+        console.log(`[${new Date().toLocaleTimeString()}] Thread session recovered: ${sessionId} (thread ${threadId.slice(0, 8)})`);
+      } else {
+        await createSession(sessionId, agentName);
+        const sLabel = agentName ? ` (agent ${agentName})` : "";
+        console.log(`[${new Date().toLocaleTimeString()}] Session recovered: ${sessionId}${sLabel}`);
+      }
+      startSession(sessionId);
+    }
+  }
+
   const rateLimitMessage = extractRateLimitMessage(rawStdout, stderr);
 
   if (rateLimitMessage) {
     stdout = rateLimitMessage;
+    const resetTime = parseRateLimitResetTime(rateLimitMessage);
+    rateLimitResetAt = resetTime ?? (Date.now() + 60 * 60_000);
+    rateLimitNotified = false;
+    console.warn(
+      `[${new Date().toLocaleTimeString()}] Rate limit detected. Reset at: ${new Date(rateLimitResetAt).toISOString()}`
+    );
   }
 
   // Surface stderr when the result event never arrived (abort, tool error, etc.)
@@ -908,16 +1058,18 @@ export async function run(
   threadId?: string,
   modelOverride?: string,
   timeoutMs?: number,
-  agentName?: string
+  agentName?: string,
+  timeoutCategory?: string
 ): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs, agentName), threadId);
+  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs, agentName, timeoutCategory), threadId);
 }
 
 async function streamClaude(
   name: string,
   prompt: string,
   onChunk: (text: string) => void,
-  onUnblock: () => void
+  onUnblock: () => void,
+  onAgentEvent?: (ev: AgentStreamEvent) => void
 ): Promise<void> {
   await mkdir(LOGS_DIR, { recursive: true });
 
@@ -985,6 +1137,8 @@ async function streamClaude(
   let buf = "";
   let unblocked = false;
   let textEmitted = false;
+  // Track pending Agent tool calls: tool_use_id → description
+  const pendingAgents = new Map<string, string>();
 
   const maybeUnblock = () => {
     if (!unblocked) {
@@ -1026,7 +1180,16 @@ async function streamClaude(
               onChunk(block.text);
               textEmitted = true;
               hasActivity = true;
-            } else if (block.type === "tool_use") {
+            }
+            // Detect Agent tool spawns and emit lifecycle event
+            if (block.type === "tool_use" && block.name === "Agent" && block.id && onAgentEvent) {
+              const description = String(block.input?.description ?? block.input?.prompt ?? "Running background task...");
+              pendingAgents.set(block.id, description);
+              onAgentEvent({ type: "spawn", id: block.id, description });
+              hasActivity = true;
+            }
+            // Always emit plugin observation for all tool_use blocks (including Agent)
+            if (block.type === "tool_use") {
               hasActivity = true;
               if (streamPm && block.name) {
                 streamPm.emitAsync("tool_result_persist", {
@@ -1038,6 +1201,21 @@ async function streamClaude(
             }
           }
           if (hasActivity) maybeUnblock();
+        } else if (event.type === "user") {
+          // Tool results come back as user messages — match Agent completions
+          type ToolResultBlock = { type: string; tool_use_id?: string; content?: unknown };
+          const msg = event.message as { content?: ToolResultBlock[] } | undefined;
+          const blocks = msg?.content ?? [];
+          for (const block of blocks) {
+            if (block.type === "tool_result" && block.tool_use_id && pendingAgents.has(block.tool_use_id)) {
+              const description = pendingAgents.get(block.tool_use_id)!;
+              pendingAgents.delete(block.tool_use_id);
+              const result = typeof block.content === "string"
+                ? block.content
+                : JSON.stringify(block.content ?? "");
+              if (onAgentEvent) onAgentEvent({ type: "done", id: block.tool_use_id, description, result });
+            }
+          }
         } else if (event.type === "tool_use") {
           // Top-level tool_use event (some stream-json versions) — unblock the UI
           maybeUnblock();
@@ -1070,9 +1248,10 @@ export async function streamUserMessage(
   name: string,
   prompt: string,
   onChunk: (text: string) => void,
-  onUnblock: () => void
+  onUnblock: () => void,
+  onAgentEvent?: (ev: AgentStreamEvent) => void
 ): Promise<void> {
-  return enqueue(() => streamClaude(name, prefixUserMessageWithClock(prompt), onChunk, onUnblock));
+  return enqueue(() => streamClaude(name, prefixUserMessageWithClock(prompt), onChunk, onUnblock, onAgentEvent));
 }
 
 function prefixUserMessageWithClock(prompt: string): string {

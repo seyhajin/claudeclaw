@@ -76,13 +76,14 @@ const DEFAULT_SETTINGS: Settings = {
     excludeWindows: [],
     forwardToTelegram: true,
   },
-  telegram: { token: "", allowedUserIds: [], listenChats: [] },
+  telegram: { token: "", allowedUserIds: [], listenChats: [], receiveEnabled: true },
   discord: { token: "", allowedUserIds: [], listenChannels: [], listenGuilds: [] },
   slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
   sessionTimeoutMs: DEFAULT_SESSION_TIMEOUT_MS,
+  timeouts: { telegram: 5, heartbeat: 15, job: 30, default: 5 },
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
   plugins: {},
@@ -106,6 +107,8 @@ export interface TelegramConfig {
   token: string;
   allowedUserIds: number[];
   listenChats: number[];
+  /** When false, skip Telegram polling (incoming messages). Useful for send-only instances. Default: true */
+  receiveEnabled: boolean;
 }
 
 export interface DiscordConfig {
@@ -134,6 +137,17 @@ export interface SecurityConfig {
   disallowedTools: string[];
 }
 
+export interface TimeoutsConfig {
+  /** Max minutes for a telegram message subprocess. Default: 5 min. */
+  telegram: number;
+  /** Max minutes for a heartbeat subprocess. Default: 15 min. */
+  heartbeat: number;
+  /** Max minutes for a scheduled job subprocess. Default: 30 min. */
+  job: number;
+  /** Max minutes for all other subprocesses (bootstrap, trigger, etc). Default: 5 min. */
+  default: number;
+}
+
 export interface Settings {
   model: string;
   api: string;
@@ -148,7 +162,9 @@ export interface Settings {
   security: SecurityConfig;
   web: WebConfig;
   stt: SttConfig;
+  apiToken?: string;
   sessionTimeoutMs: number;
+  timeouts: TimeoutsConfig;
   watchdog: WatchdogSettings;
   plugins: Record<string, PluginEntry>;
   session: SessionConfig;
@@ -187,6 +203,10 @@ export interface SttConfig {
   baseUrl: string;
   /** Model name passed to the API (default: "Systran/faster-whisper-large-v3") */
   model: string;
+  /** MCP tool name or CLI command to delegate transcription to (e.g. "mcp__whisper__transcribe"
+   *  or "whisper"). When set, whisper is skipped and Claude is asked to call this tool directly
+   *  with the audio file path. When unset (default), whisper handles transcription. */
+  delegateTool?: string;
 }
 
 export interface SessionConfig {
@@ -302,6 +322,7 @@ function parseSettings(
       token: process.env.TELEGRAM_TOKEN?.trim() || (typeof raw.telegram?.token === "string" ? raw.telegram.token.trim() : ""),
       allowedUserIds: raw.telegram?.allowedUserIds ?? [],
       listenChats: Array.isArray(raw.telegram?.listenChats) ? raw.telegram.listenChats.map(Number) : [],
+      receiveEnabled: raw.telegram?.receiveEnabled !== false,
     },
     discord: {
       token: process.env.DISCORD_TOKEN?.trim() || (typeof raw.discord?.token === "string" ? raw.discord.token.trim() : ""),
@@ -340,10 +361,19 @@ function parseSettings(
     stt: {
       baseUrl: typeof raw.stt?.baseUrl === "string" ? raw.stt.baseUrl.trim() : "",
       model: typeof raw.stt?.model === "string" ? raw.stt.model.trim() : "",
+      ...(typeof raw.stt?.delegateTool === "string" && raw.stt.delegateTool.trim()
+        ? { delegateTool: raw.stt.delegateTool.trim() }
+        : {}),
     },
     sessionTimeoutMs: typeof raw.sessionTimeoutMs === "number" && raw.sessionTimeoutMs > 0
       ? raw.sessionTimeoutMs
       : DEFAULT_SESSION_TIMEOUT_MS,
+    timeouts: {
+      telegram: Number.isFinite(raw.timeouts?.telegram) && Number(raw.timeouts.telegram) > 0 ? Number(raw.timeouts.telegram) : 5,
+      heartbeat: Number.isFinite(raw.timeouts?.heartbeat) && Number(raw.timeouts.heartbeat) > 0 ? Number(raw.timeouts.heartbeat) : 15,
+      job: Number.isFinite(raw.timeouts?.job) && Number(raw.timeouts.job) > 0 ? Number(raw.timeouts.job) : 30,
+      default: Number.isFinite(raw.timeouts?.default) && Number(raw.timeouts.default) > 0 ? Number(raw.timeouts.default) : 5,
+    },
     watchdog: parseWatchdogConfig(raw.watchdog),
     plugins: parsePlugins(raw.plugins),
     session: {
@@ -352,6 +382,7 @@ function parseSettings(
       maxAgeHours: Number.isFinite(raw.session?.maxAgeHours) ? Number(raw.session.maxAgeHours) : 24,
       summaryPath: typeof raw.session?.summaryPath === "string" ? raw.session.summaryPath.trim() : "",
     },
+    apiToken: typeof raw.apiToken === "string" && raw.apiToken.trim() ? raw.apiToken.trim() : undefined,
     ...(typeof raw.jobsDir === "string" && raw.jobsDir.trim() ? { jobsDir: raw.jobsDir.trim() } : {}),
   };
 }

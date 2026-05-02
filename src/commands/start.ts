@@ -5,7 +5,7 @@ import { fileURLToPath } from "url";
 import { run, runUserMessage, streamUserMessage, bootstrap, ensureProjectClaudeMd, loadHeartbeatPromptTemplate } from "../runner";
 import { writeState, type StateData } from "../statusline";
 import { cronMatches, nextCronMatch } from "../cron";
-import { clearJobSchedule, loadJobs } from "../jobs";
+import { clearJobSchedule, loadJobs, snapshotJobFrontmatter } from "../jobs";
 import { writePidFile, cleanupPidFile, checkExistingDaemon } from "../pid";
 import { initConfig, loadSettings, reloadSettings, resolvePrompt, type HeartbeatConfig, type Settings } from "../config";
 import { getDayAndMinuteAtOffset, buildClockPromptPrefix } from "../timezone";
@@ -376,14 +376,26 @@ export async function start(args: string[] = []) {
   // --- Telegram ---
   let telegramSend: ((chatId: number, text: string) => Promise<void>) | null = null;
   let telegramToken = "";
+  let telegramReceiveEnabled = true;
 
-  async function initTelegram(token: string) {
+  async function initTelegram(token: string, receiveEnabled = true) {
     if (token && token !== telegramToken) {
       const { startPolling, sendMessage } = await import("./telegram");
-      startPolling(debugFlag);
+      if (receiveEnabled) startPolling(debugFlag);
       telegramSend = (chatId, text) => sendMessage(token, chatId, text);
       telegramToken = token;
-      console.log(`[${ts()}] Telegram: enabled`);
+      telegramReceiveEnabled = receiveEnabled;
+      console.log(`[${ts()}] Telegram: enabled${receiveEnabled ? "" : " (send-only)"}`);
+    } else if (token && token === telegramToken && receiveEnabled !== telegramReceiveEnabled) {
+      const { startPolling, stopPolling } = await import("./telegram");
+      if (receiveEnabled) {
+        startPolling(debugFlag);
+        console.log(`[${ts()}] Telegram: receive enabled`);
+      } else {
+        stopPolling();
+        console.log(`[${ts()}] Telegram: receive disabled (send-only)`);
+      }
+      telegramReceiveEnabled = receiveEnabled;
     } else if (!token && telegramToken) {
       telegramSend = null;
       telegramToken = "";
@@ -391,7 +403,7 @@ export async function start(args: string[] = []) {
     }
   }
 
-  await initTelegram(currentSettings.telegram.token);
+  await initTelegram(currentSettings.telegram.token, currentSettings.telegram.receiveEnabled);
   if (!telegramToken) console.log("  Telegram: not configured");
 
   // --- Discord ---
@@ -503,13 +515,13 @@ export async function start(args: string[] = []) {
             updateState();
             console.log(`[${ts()}] Jobs reloaded from Web UI`);
           },
-          onChat: async (message, onChunk, onUnblock) => {
+          onChat: async (message, onChunk, onUnblock, onAgentEvent) => {
             const wizardCtx = { iface: "web" as const, scopeId: "default" };
             if (isWizardTrigger(message) || hasActiveWizard(wizardCtx)) {
               onChunk(await handleWizardInput(wizardCtx, message));
               return;
             }
-            await streamUserMessage("chat", message, onChunk, onUnblock);
+            await streamUserMessage("chat", message, onChunk, onUnblock, onAgentEvent);
           },
         });
       } catch (err) {
@@ -707,7 +719,7 @@ export async function start(args: string[] = []) {
       currentJobs = newJobs;
 
       // Telegram changes
-      await initTelegram(newSettings.telegram.token);
+      await initTelegram(newSettings.telegram.token, newSettings.telegram.receiveEnabled);
 
       // Discord changes
       await initDiscord(newSettings.discord.token);
@@ -747,51 +759,57 @@ export async function start(args: string[] = []) {
 
   function runJob(job: (typeof currentJobs)[0]) {
     const timeoutMs = job.timeoutSeconds ? job.timeoutSeconds * 1000 : undefined;
-    resolvePrompt(job.prompt)
-      .then((prompt) => {
-        const clock = buildClockPromptPrefix(new Date(), currentSettings.timezoneOffsetMinutes);
-        return run(
-          job.name,
-          `${clock}\n${prompt}`,
-          job.agent ? `agent:${job.agent}` : job.name,
-          job.model,
-          timeoutMs,
-          job.agent
-        );
-      })
-      .then((r) => {
-        if (r.exitCode === 0) {
-          jobRetryState.delete(job.name);
-        } else if (job.retry && job.retry > 0) {
-          // Preserve existing state so failCount accumulates correctly across retries.
-          const state = jobRetryState.get(job.name) ?? { failCount: 0, retryAt: 0 };
-          state.failCount += 1;
-          if (state.failCount <= job.retry) {
-            const delayMs = (job.retryDelay ?? 300) * 1000;
-            state.retryAt = Date.now() + delayMs;
-            jobRetryState.set(job.name, state);
-            console.log(`[${ts()}] Job ${job.name} failed (attempt ${state.failCount}/${job.retry}), retrying in ${job.retryDelay ?? 300}s`);
-          } else {
-            jobRetryState.delete(job.name);
-            console.log(`[${ts()}] Job ${job.name} exhausted ${job.retry} retries`);
-          }
-        }
-        if (job.notify === false) return;
-        if (job.notify === "error" && r.exitCode === 0) return;
-        forwardToTelegram(job.name, r);
-        forwardToDiscord(job.name, r);
-      })
-      .finally(async () => {
-        if (job.recurring) return;
-        // Only clear one-shot schedule when no retry is pending.
-        if (jobRetryState.has(job.name)) return;
-        try {
-          await clearJobSchedule(job.name);
-          console.log(`[${ts()}] Cleared schedule for one-time job: ${job.name}`);
-        } catch (err) {
-          console.error(`[${ts()}] Failed to clear schedule for ${job.name}:`, err);
-        }
-      });
+    snapshotJobFrontmatter(job.name)
+      .then((restoreFrontmatter) =>
+        resolvePrompt(job.prompt)
+          .then((prompt) => {
+            const clock = buildClockPromptPrefix(new Date(), currentSettings.timezoneOffsetMinutes);
+            return run(
+              job.name,
+              `${clock}\n${prompt}`,
+              job.agent ? `agent:${job.agent}` : job.name,
+              job.model,
+              timeoutMs,
+              job.agent,
+              "job"
+            );
+          })
+          .then(async (r) => {
+            const restored = await restoreFrontmatter();
+            if (restored) console.log(`[${ts()}] Restored frontmatter for job: ${job.name}`);
+            if (r.exitCode === 0) {
+              jobRetryState.delete(job.name);
+            } else if (job.retry && job.retry > 0) {
+              // Preserve existing state so failCount accumulates correctly across retries.
+              const state = jobRetryState.get(job.name) ?? { failCount: 0, retryAt: 0 };
+              state.failCount += 1;
+              if (state.failCount <= job.retry) {
+                const delayMs = (job.retryDelay ?? 300) * 1000;
+                state.retryAt = Date.now() + delayMs;
+                jobRetryState.set(job.name, state);
+                console.log(`[${ts()}] Job ${job.name} failed (attempt ${state.failCount}/${job.retry}), retrying in ${job.retryDelay ?? 300}s`);
+              } else {
+                jobRetryState.delete(job.name);
+                console.log(`[${ts()}] Job ${job.name} exhausted ${job.retry} retries`);
+              }
+            }
+            if (job.notify === false) return;
+            if (job.notify === "error" && r.exitCode === 0) return;
+            forwardToTelegram(job.name, r);
+            forwardToDiscord(job.name, r);
+          })
+          .finally(async () => {
+            if (job.recurring) return;
+            // Only clear one-shot schedule when no retry is pending.
+            if (jobRetryState.has(job.name)) return;
+            try {
+              await clearJobSchedule(job.name);
+              console.log(`[${ts()}] Cleared schedule for one-time job: ${job.name}`);
+            } catch (err) {
+              console.error(`[${ts()}] Failed to clear schedule for ${job.name}:`, err);
+            }
+          })
+      );
   }
 
   setInterval(() => {

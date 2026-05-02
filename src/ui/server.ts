@@ -1,11 +1,13 @@
 import { htmlPage } from "./page/html";
 import { clampInt, json } from "./http";
+import { checkBearer } from "./auth";
 import type { StartWebUiOptions, WebServerHandle } from "./types";
 import { buildState, buildTechnicalInfo, sanitizeSettings } from "./services/state";
 import { readHeartbeatSettings, updateHeartbeatSettings } from "./services/settings";
 import { createQuickJob, deleteJob } from "./services/jobs";
 import { readLogs } from "./services/logs";
 import { listSessions, readSessionMessages, listAgents } from "./services/sessions";
+import { runUserMessage } from "../runner";
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
   const server = Bun.serve({
@@ -178,6 +180,30 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         }
       }
 
+      if (url.pathname === "/api/inject" && req.method === "POST") {
+        const authErr = checkBearer(req, opts.getSnapshot().settings.apiToken);
+        if (authErr) return authErr;
+        try {
+          const body = await req.json();
+          const message = typeof body.message === "string" ? body.message.trim() : "";
+          if (!message) return json({ ok: false, error: "message is required" }, 400);
+          const result = await runUserMessage("inject", message);
+          const text = result.stdout.trim();
+          const { telegram } = opts.getSnapshot().settings;
+          if (text && telegram.token && telegram.allowedUserIds.length > 0) {
+            const chatId = telegram.allowedUserIds[0];
+            fetch(`https://api.telegram.org/bot${telegram.token}/sendMessage`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ chat_id: chatId, text }),
+            }).catch(() => {});
+          }
+          return json({ ok: true, result: result.stdout, exitCode: result.exitCode });
+        } catch (err) {
+          return json({ ok: false, error: String(err) }, 500);
+        }
+      }
+
       if (url.pathname === "/api/chat" && req.method === "POST") {
         if (!opts.onChat) return json({ ok: false, error: "chat not configured" });
         try {
@@ -196,7 +222,8 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
                 await onChat(
                   message,
                   (chunk) => send({ type: "chunk", text: chunk }),
-                  () => send({ type: "unblock" })
+                  () => send({ type: "unblock" }),
+                  (ev) => send({ type: ev.type === "spawn" ? "agent_spawn" : "agent_done", id: ev.id, description: ev.description, result: ev.result })
                 );
                 send({ type: "done" });
               } catch (err) {
